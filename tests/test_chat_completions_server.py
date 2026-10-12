@@ -465,6 +465,38 @@ def test_invalid_request_returns_openai_error(monkeypatch):
     assert model.calls == []
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("role", [[], {}, None, 1, "unknown"])
+def test_invalid_message_role_returns_openai_error(
+    isolated_llm_user_dir, monkeypatch, role, stream
+):
+    model = AsyncMockModel(["Should not execute"])
+    use_model(monkeypatch, model)
+
+    response = request(
+        llm_chat_completions_server.create_app(),
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": model.model_id,
+            "messages": [{"role": role, "content": "Hello"}],
+            "stream": stream,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "'messages[0].role' must be one of system, developer, user, assistant, or tool.",
+            "type": "invalid_request_error",
+            "param": "messages[0].role",
+            "code": None,
+        }
+    }
+    assert model.calls == []
+    assert not (isolated_llm_user_dir / "logs.db").exists()
+
+
 def test_command_defaults_and_reload(monkeypatch):
     calls = []
     monkeypatch.setattr(

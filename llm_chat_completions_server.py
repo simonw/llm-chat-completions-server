@@ -194,7 +194,13 @@ def openai_messages_to_llm(messages):
             raise RequestError(f"'{param}' must be an object.", param)
 
         role = message.get("role")
-        if role not in {"system", "developer", "user", "assistant", "tool"}:
+        if not isinstance(role, str) or role not in {
+            "system",
+            "developer",
+            "user",
+            "assistant",
+            "tool",
+        }:
             raise RequestError(
                 f"'{param}.role' must be one of system, developer, user, assistant, or tool.",
                 f"{param}.role",
