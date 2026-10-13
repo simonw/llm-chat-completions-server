@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from click.testing import CliRunner
 import llm
 import pytest
 import sqlite_utils
+from llm.logs import LogStore
 from llm.parts import (
     AttachmentPart,
     Message,
@@ -231,6 +233,186 @@ def test_chat_completion_uses_async_model_and_llm_messages(monkeypatch):
     assert [message.to_dict() for message in prompt.messages] == [
         message.to_dict() for message in expected_messages
     ]
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
+@pytest.mark.parametrize("capture", ["model", "logs"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            ["Before", b"first image", "Between", b"second image", "After"],
+            id="interleaved",
+        ),
+        pytest.param([b"first image", "After"], id="image-first"),
+        pytest.param(["First", "Second"], id="adjacent-text"),
+        pytest.param(["", b"first image"], id="empty-text"),
+        pytest.param([""], id="empty-text-only"),
+        pytest.param(["", ""], id="adjacent-empty-text"),
+        pytest.param("Plain text", id="string"),
+        pytest.param(["One text part"], id="text-array"),
+        pytest.param(
+            ["Describe", b"first image", b"second image"],
+            id="text-then-images",
+        ),
+        pytest.param([b"first image", b"second image"], id="images-only"),
+    ],
+)
+def test_trailing_user_content_preserves_canonical_input(
+    isolated_llm_user_dir, monkeypatch, content, capture, stream
+):
+    # Build client content and its expected canonical value independently of
+    # the server's conversion/splitting helpers. Data URLs keep logging offline.
+    expected_parts = []
+    client_parts = []
+    for part in [content] if isinstance(content, str) else content:
+        if isinstance(part, str):
+            expected_parts.append(TextPart(text=part))
+            client_parts.append({"type": "text", "text": part})
+        else:
+            expected_parts.append(
+                AttachmentPart(
+                    attachment=llm.Attachment(type="image/png", content=part)
+                )
+            )
+            client_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,"
+                        + base64.b64encode(part).decode()
+                    },
+                }
+            )
+    expected_messages = [
+        Message(role="system", parts=[TextPart(text="Keep order")]),
+        Message(role="user", parts=[TextPart(text="Earlier question")]),
+        Message(role="assistant", parts=[TextPart(text="Earlier answer")]),
+        Message(role="user", parts=expected_parts),
+    ]
+    model = AsyncMockModel(["Done"])
+    model.attachment_types = {"image/png"}
+    use_model(monkeypatch, model)
+
+    response = request(
+        llm_chat_completions_server.create_app(),
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": model.model_id,
+            "messages": [
+                {"role": "system", "content": "Keep order"},
+                {"role": "user", "content": "Earlier question"},
+                {"role": "assistant", "content": "Earlier answer"},
+                {
+                    "role": "user",
+                    "content": content if isinstance(content, str) else client_parts,
+                },
+            ],
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200
+    if stream:
+        assert response.text.endswith("data: [DONE]\n\n")
+        assert '"error"' not in response.text
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "Done"
+    assert len(model.calls) == 1
+
+    if capture == "model":
+        prompt = model.calls[0]["prompt"]
+        observed_messages = prompt.messages
+    else:
+        db = sqlite_utils.Database(isolated_llm_user_dir / "logs.db")
+        turns = list(db["turns"].rows)
+        assert len(turns) == 1
+        observed_messages = LogStore(db).load_chain(turns[0]["parent_message_hash"])
+    assert [message.to_dict() for message in observed_messages] == [
+        message.to_dict() for message in expected_messages
+    ]
+    if capture == "model":
+        assert prompt.system == "Keep order"
+        assert prompt.prompt == "".join(
+            part.text for part in expected_parts if isinstance(part, TextPart)
+        )
+        assert [attachment.content for attachment in prompt.attachments] == [
+            part.attachment.content
+            for part in expected_parts
+            if isinstance(part, AttachmentPart)
+        ]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("attachment_types", [set(), {"image/jpeg"}])
+@pytest.mark.parametrize("image_first", [False, True])
+def test_ordered_content_retains_attachment_rejection(
+    isolated_llm_user_dir, monkeypatch, stream, attachment_types, image_first
+):
+    model = AsyncMockModel(["Must not execute"])
+    model.attachment_types = attachment_types
+    use_model(monkeypatch, model)
+    text = {"type": "text", "text": "Describe"}
+    image = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,eA=="},
+    }
+    response = request(
+        llm_chat_completions_server.create_app(),
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": model.model_id,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [image, text] if image_first else [text, image],
+                }
+            ],
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert model.calls == []
+    assert not (isolated_llm_user_dir / "logs.db").exists()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("content_array", [False, True])
+def test_custom_prompt_override_is_preserved(monkeypatch, stream, content_array):
+    class CustomPromptModel(AsyncMockModel):
+        def prompt(self, *args, **kwargs):
+            kwargs["prompt"] = (kwargs["prompt"] or "") + " transformed"
+            response = super().prompt(*args, **kwargs)
+            response.prompt.plugin_marker = "custom"
+            self.created_response = response
+            self.created_prompt = response.prompt
+            return response
+
+    model = CustomPromptModel(["Done"])
+    use_model(monkeypatch, model)
+    content = (
+        [{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]
+        if content_array
+        else "AB"
+    )
+    response = request(
+        llm_chat_completions_server.create_app(),
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": model.model_id,
+            "messages": [{"role": "user", "content": content}],
+            "stream": stream,
+        },
+    )
+    assert response.status_code == 200
+    assert len(model.calls) == 1
+    assert model.calls[0]["response"] is model.created_response
+    assert model.calls[0]["prompt"] is model.created_prompt
+    assert model.created_prompt.plugin_marker == "custom"
+    assert model.created_prompt.prompt == "AB transformed"
 
 
 def test_chat_completion_passes_tools_and_returns_tool_calls(monkeypatch):

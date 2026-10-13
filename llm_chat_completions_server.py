@@ -117,9 +117,11 @@ async def chat_completions(request):
         tools = openai_tools_to_llm(body)
         options, schema = options_and_schema(model, body)
         legacy_system = system_from_messages(messages)
+        canonical_messages = messages
         messages, prompt, attachments = split_final_user_message(messages)
 
-        response = model.prompt(
+        model_prompt = model.prompt
+        response = model_prompt(
             prompt=prompt,
             system=legacy_system,
             attachments=attachments,
@@ -129,6 +131,25 @@ async def chat_completions(request):
             schema=schema,
             options=options,
         )
+        if (
+            getattr(model_prompt, "__func__", None)
+            in (llm.AsyncModel.prompt, llm.AsyncKeyModel.prompt)
+            and response.prompt.messages != canonical_messages
+        ):
+            # The standard method validates legacy input, then appends its
+            # flattened projection. Restore exact parts on the same response
+            # while keeping that validated input available to older adapters.
+            validated_prompt = response.prompt
+            response.prompt = llm.Prompt(
+                prompt,
+                model=validated_prompt.model,
+                attachments=attachments,
+                system=legacy_system,
+                messages=canonical_messages,
+                options=validated_prompt.options,
+                schema=validated_prompt.schema,
+                tools=validated_prompt.tools,
+            )
     except RequestError as ex:
         return error_response(ex.message, param=ex.param, code=ex.code)
     except ValueError as ex:

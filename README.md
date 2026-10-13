@@ -85,6 +85,13 @@ including image URL content and function tool calls. Sampling options are
 passed through when they are supported by the selected LLM model. Only
 `n=1` is currently supported.
 
+For models using LLM's inherited `prompt()` method, content parts retain their
+order and text boundaries in the input messages and logs, including interleaved
+text and images. The legacy prompt text and attachment list remain available
+in their flattened form. Custom `prompt()` overrides retain their existing
+behavior. Provider plugins may still normalize parts before sending them to
+the service, so provider request ordering depends on the selected plugin.
+
 Completed responses—including streamed responses—are written to LLM's normal
 `logs.db`. This populates both the legacy response tables and the current
 content-addressed message and turn tables. The global `llm logs off` setting
